@@ -1,0 +1,7 @@
+[project]
+name = "smiles-2026-hallucination-detection"
+version = "0.1.0"
+description = "My application for SMILES 2026"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []

@@ -18,6 +18,9 @@ single entry point called from the notebook.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
+
+TOKEN_TAILS = 64
 
 
 def aggregate(
@@ -41,21 +44,44 @@ def aggregate(
         Replace or extend the skeleton below with alternative layer selection,
         token pooling (mean, max, weighted), or multi-layer fusion strategies.
     """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the aggregation below.
-    # ------------------------------------------------------------------
+    n_hs = hidden_states.shape[0]
+    n_layers = n_hs - 1
 
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
+    features = hidden_states.new_zeros(n_layers)
+    if n_layers <= 1:
+        return features.float()
 
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
+    # suppose that last TOKEN_TAILS tokens are the response
+    token_mask = attention_mask.to(device=hidden_states.device, dtype=torch.bool)
+    response_pos = token_mask.nonzero(as_tuple=False).squeeze(-1)[-TOKEN_TAILS:]
+    n_response_tokens = response_pos.numel()
+    if n_response_tokens <= 1:
+        return features.float()
 
-    feature = layer[last_pos]          # (hidden_dim,)
+    # delta = x^l - x^(l-1) for each token on each layer
+    contexts = hidden_states[1:n_layers, response_pos]
+    updates = contexts - hidden_states[: n_layers - 1, response_pos]
 
-    return feature
-    # ------------------------------------------------------------------
+    # compute update directions of hidden states and project onto them
+    projections = torch.einsum("lcd,ltd->lct", contexts, updates)
+    projections = projections / contexts.norm(dim=-1).clamp_min(1e-8).unsqueeze(-1)
+
+    # Jensen-Shannon divergence between the projection and uniform distribution
+    log_proj = F.log_softmax(projections, dim=1)
+    proj = log_proj.exp()
+    uniform = 1.0 / n_response_tokens
+    log_uniform = -torch.log(
+        projections.new_tensor(n_response_tokens, dtype=torch.float32)
+    )
+    midpoint = 0.5 * (proj + uniform)
+    log_midpoint = midpoint.log()
+
+    js_scores = 0.5 * (proj * (log_proj - log_midpoint)).sum(dim=1) + 0.5 * (
+        uniform * (log_uniform - log_midpoint)
+    ).sum(dim=1)
+
+    features[1:n_layers] = js_scores.mean(dim=1)
+    return features.float()
 
 
 def extract_geometric_features(
