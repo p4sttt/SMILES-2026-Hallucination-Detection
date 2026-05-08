@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 
 def split_data(
@@ -50,26 +50,22 @@ def split_data(
         Replace or extend the skeleton below.  The only contract is that the
         function returns the list described above.
     """
-    idx = np.arange(len(y))
+    folds = []
 
-    idx_train_val, idx_test = train_test_split(
-        idx,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y,
-    )
-    relative_val = val_size / (1.0 - test_size)
-    idx_train, idx_val = train_test_split(
-        idx_train_val,
-        test_size=relative_val,
-        random_state=random_state,
-        stratify=y[idx_train_val],
-    )
-
-    return [
-        (
-            np.asarray(idx_train, dtype=int),
-            np.asarray(idx_val, dtype=int),
-            np.asarray(idx_test, dtype=int),
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    for fold_idx, (idx_train_val, idx_test) in enumerate(cv.split(idx, y)):
+        idx_train, idx_val = train_test_split(
+            idx_train_val,
+            test_size=val_size,
+            random_state=random_state + fold_idx,
+            stratify=y[idx_train_val],
         )
-    ]
+        folds.append(
+            (
+                np.asarray(idx_train, dtype=int),
+                np.asarray(idx_val, dtype=int),
+                np.asarray(idx_test, dtype=int),
+            )
+        )
+
+    return folds
