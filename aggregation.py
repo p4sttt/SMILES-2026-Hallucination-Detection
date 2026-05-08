@@ -25,6 +25,7 @@ MIN_RESPONSE_TOKENS = 6
 RESPONSE_FRACTION = 0.35
 MAX_RESPONSE_TOKENS = 192
 FEATURES_PER_TRANSITION = 7
+POOL_LAYER_OFFSETS = (-1, -2, -4, -8, -12)
 
 
 def aggregate(
@@ -52,7 +53,11 @@ def aggregate(
     n_hs = hidden_states.shape[0]
     n_layer_transitions = max(n_hs - 2, 0)
 
-    features = hidden_states.new_zeros(n_layer_transitions * FEATURES_PER_TRANSITION)
+    hidden_dim = hidden_states.shape[-1]
+    pooled_dim = len(POOL_LAYER_OFFSETS) * hidden_dim * 2
+    features = hidden_states.new_zeros(
+        n_layer_transitions * FEATURES_PER_TRANSITION + pooled_dim
+    )
     if n_layer_transitions == 0:
         return features.float()
 
@@ -107,7 +112,7 @@ def aggregate(
     cosine_drift = 1.0 - F.cosine_similarity(response_next, response_prev, dim=-1)
     cosine_drift = cosine_drift.mean(dim=1)
 
-    return torch.stack(
+    icr_features = torch.stack(
         [
             js_mean,
             entropy_mean,
@@ -119,6 +124,33 @@ def aggregate(
         ],
         dim=1,
     ).flatten().float()
+
+    pooling_features = _pool_hidden_state_features(hidden_states, response_pos)
+    return torch.cat([icr_features, pooling_features], dim=0).float()
+
+
+def _pool_hidden_state_features(
+    hidden_states: torch.Tensor,
+    response_pos: torch.Tensor,
+) -> torch.Tensor:
+    pooled = []
+    n_hs = hidden_states.shape[0]
+
+    for offset in POOL_LAYER_OFFSETS:
+        layer_idx = n_hs + offset
+        prev_layer_idx = layer_idx - 1
+        if layer_idx <= 0 or prev_layer_idx < 0:
+            continue
+
+        current = hidden_states[layer_idx, response_pos].float()
+        previous = hidden_states[prev_layer_idx, response_pos].float()
+        pooled.append(current.mean(dim=0))
+        pooled.append((current - previous).mean(dim=0))
+
+    if not pooled:
+        return hidden_states.new_zeros(0)
+
+    return torch.cat(pooled, dim=0).float()
 
 
 def _real_token_positions(
@@ -207,7 +239,7 @@ def aggregation_and_feature_extraction(
 
     Returns:
         A 1-D float tensor. With the default aggregation for Qwen2.5-0.5B,
-        this has 161 values, plus any optional geometric features.
+        this has 9121 values, plus any optional geometric features.
     """
     agg_features = aggregate(hidden_states, attention_mask)  # (feature_dim,)
 
