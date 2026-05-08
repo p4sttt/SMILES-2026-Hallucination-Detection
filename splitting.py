@@ -30,15 +30,17 @@ def split_data(
 ) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
     """Split dataset indices into train, validation, and test subsets.
 
-    The default strategy performs a single stratified random split preserving
-    the class ratio in each subset.
+    The default strategy performs 5-fold stratified cross-validation. Inside
+    each training fold, a small stratified validation split is carved out for
+    probe hyperparameter and threshold tuning.
 
     Args:
         y:            Label array of shape ``(N,)`` with values in ``{0, 1}``.
                       Used for stratification.
         df:           Optional full DataFrame (same row order as ``y``).
                       Required for group-aware splits.
-        test_size:    Fraction of samples reserved for the held-out test set.
+        test_size:    Kept for API compatibility; 5-fold CV uses 20% test
+                      per fold.
         val_size:     Fraction of samples reserved for validation.
         random_state: Random seed for reproducible splits.
 
@@ -50,6 +52,7 @@ def split_data(
         Replace or extend the skeleton below.  The only contract is that the
         function returns the list described above.
     """
+    idx = np.arange(len(y))
     folds = []
 
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
