@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import (
+    StratifiedGroupKFold,
+    StratifiedKFold,
+    train_test_split,
+)
 
 
 def split_data(
@@ -30,9 +34,11 @@ def split_data(
 ) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
     """Split dataset indices into train, validation, and test subsets.
 
-    The default strategy performs 5-fold stratified cross-validation. Inside
-    each training fold, a small stratified validation split is carved out for
-    probe hyperparameter and threshold tuning.
+    The default strategy performs 5-fold stratified cross-validation. If the
+    source DataFrame is provided, exact duplicate responses are kept in the same
+    fold to avoid leaking repeated answers across train/validation/test.
+    Inside each training fold, a small validation split is carved out for probe
+    hyperparameter and threshold tuning.
 
     Args:
         y:            Label array of shape ``(N,)`` with values in ``{0, 1}``.
@@ -55,13 +61,21 @@ def split_data(
     idx = np.arange(len(y))
     folds = []
 
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
-    for fold_idx, (idx_train_val, idx_test) in enumerate(cv.split(idx, y)):
-        idx_train, idx_val = train_test_split(
-            idx_train_val,
-            test_size=val_size,
+    groups = _response_groups(df, len(y))
+    if groups is None:
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+        split_iter = cv.split(idx, y)
+    else:
+        cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=random_state)
+        split_iter = cv.split(idx, y, groups)
+
+    for fold_idx, (idx_train_val, idx_test) in enumerate(split_iter):
+        idx_train, idx_val = _split_train_val(
+            idx_train_val=idx_train_val,
+            y=y,
+            groups=groups,
+            val_size=val_size,
             random_state=random_state + fold_idx,
-            stratify=y[idx_train_val],
         )
         folds.append(
             (
@@ -72,3 +86,46 @@ def split_data(
         )
 
     return folds
+
+
+def _response_groups(df: pd.DataFrame | None, n_rows: int) -> np.ndarray | None:
+    if df is None or "response" not in df.columns or len(df) != n_rows:
+        return None
+    return pd.factorize(df["response"].fillna("").astype(str), sort=False)[0]
+
+
+def _split_train_val(
+    idx_train_val: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray | None,
+    val_size: float,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if groups is None:
+        return train_test_split(
+            idx_train_val,
+            test_size=val_size,
+            random_state=random_state,
+            stratify=y[idx_train_val],
+        )
+
+    n_val_splits = max(2, int(round(1.0 / val_size)))
+    n_groups = np.unique(groups[idx_train_val]).size
+    min_class_count = int(np.bincount(y[idx_train_val].astype(int)).min())
+    if n_groups < n_val_splits or min_class_count < n_val_splits:
+        return train_test_split(
+            idx_train_val,
+            test_size=val_size,
+            random_state=random_state,
+            stratify=y[idx_train_val],
+        )
+
+    inner_cv = StratifiedGroupKFold(
+        n_splits=n_val_splits,
+        shuffle=True,
+        random_state=random_state,
+    )
+    inner_train, inner_val = next(
+        inner_cv.split(idx_train_val, y[idx_train_val], groups[idx_train_val])
+    )
+    return idx_train_val[inner_train], idx_train_val[inner_val]

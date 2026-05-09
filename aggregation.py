@@ -24,8 +24,8 @@ TOKEN_TAILS = 64
 MIN_RESPONSE_TOKENS = 6
 RESPONSE_FRACTION = 0.35
 MAX_RESPONSE_TOKENS = 192
-FEATURES_PER_TRANSITION = 7
-POOL_LAYER_OFFSETS = (-1, -2, -4, -8, -12)
+FEATURES_PER_TRANSITION = 10
+GLOBAL_FEATURES = 8
 
 
 def aggregate(
@@ -42,9 +42,10 @@ def aggregate(
                         tokens and 0 for padding.
 
     Returns:
-        A 1-D feature tensor with several ICR-like and hidden-state dynamics
-        values per transition between transformer layers. For Qwen2.5-0.5B,
-        this is ``23 * FEATURES_PER_TRANSITION`` values.
+        A compact 1-D feature tensor with ICR-like projection statistics,
+        hidden-state dynamics summaries, and a few global response/context
+        alignment features. For Qwen2.5-0.5B this is
+        ``23 * FEATURES_PER_TRANSITION + GLOBAL_FEATURES`` values.
 
     Student task:
         Replace or extend the skeleton below with alternative layer selection,
@@ -53,10 +54,8 @@ def aggregate(
     n_hs = hidden_states.shape[0]
     n_layer_transitions = max(n_hs - 2, 0)
 
-    hidden_dim = hidden_states.shape[-1]
-    pooled_dim = len(POOL_LAYER_OFFSETS) * hidden_dim * 2
     features = hidden_states.new_zeros(
-        n_layer_transitions * FEATURES_PER_TRANSITION + pooled_dim
+        n_layer_transitions * FEATURES_PER_TRANSITION + GLOBAL_FEATURES
     )
     if n_layer_transitions == 0:
         return features.float()
@@ -108,9 +107,15 @@ def aggregate(
     # heuristic, so the last n_response_tokens columns correspond to response.
     response_mass = proj[..., -n_response_tokens:].sum(dim=-1).mean(dim=1)
 
-    update_norm = response_updates.norm(dim=-1).mean(dim=1)
+    update_norm_by_token = response_updates.norm(dim=-1)
+    update_norm_mean = update_norm_by_token.mean(dim=1)
+    update_norm_std = update_norm_by_token.std(dim=1, unbiased=False)
+
     cosine_drift = 1.0 - F.cosine_similarity(response_next, response_prev, dim=-1)
-    cosine_drift = cosine_drift.mean(dim=1)
+    cosine_drift_mean = cosine_drift.mean(dim=1)
+    cosine_drift_std = cosine_drift.std(dim=1, unbiased=False)
+
+    hidden_norm = response_next.norm(dim=-1).mean(dim=1)
 
     icr_features = torch.stack(
         [
@@ -119,38 +124,68 @@ def aggregate(
             max_prob,
             topk_mass,
             response_mass,
-            update_norm,
-            cosine_drift,
+            update_norm_mean,
+            update_norm_std,
+            cosine_drift_mean,
+            cosine_drift_std,
+            hidden_norm,
         ],
         dim=1,
     ).flatten().float()
 
-    pooling_features = _pool_hidden_state_features(hidden_states, response_pos)
-    return torch.cat([icr_features, pooling_features], dim=0).float()
+    global_features = _global_response_features(
+        hidden_states,
+        context_pos,
+        response_pos,
+        update_norm_by_token,
+    )
+    return torch.cat([icr_features, global_features], dim=0).float()
 
 
-def _pool_hidden_state_features(
+def _global_response_features(
     hidden_states: torch.Tensor,
+    context_pos: torch.Tensor,
     response_pos: torch.Tensor,
+    update_norm_by_token: torch.Tensor,
 ) -> torch.Tensor:
-    pooled = []
-    n_hs = hidden_states.shape[0]
+    n_context_tokens = context_pos.numel()
+    n_response_tokens = response_pos.numel()
 
-    for offset in POOL_LAYER_OFFSETS:
-        layer_idx = n_hs + offset
-        prev_layer_idx = layer_idx - 1
-        if layer_idx <= 0 or prev_layer_idx < 0:
-            continue
+    final_response = hidden_states[-1, response_pos].float()
+    final_norm = final_response.norm(dim=-1)
+    final_response_mean = final_response.mean(dim=0)
+    last_response = final_response[-1]
 
-        current = hidden_states[layer_idx, response_pos].float()
-        previous = hidden_states[prev_layer_idx, response_pos].float()
-        pooled.append(current.mean(dim=0))
-        pooled.append((current - previous).mean(dim=0))
+    prompt_pos = context_pos[:-n_response_tokens]
+    if prompt_pos.numel() > 0:
+        prompt_mean = hidden_states[-1, prompt_pos].float().mean(dim=0)
+        prompt_response_cosine = F.cosine_similarity(
+            final_response_mean.unsqueeze(0),
+            prompt_mean.unsqueeze(0),
+            dim=-1,
+        ).squeeze(0)
+    else:
+        prompt_response_cosine = final_response.new_tensor(0.0)
 
-    if not pooled:
-        return hidden_states.new_zeros(0)
+    last_to_mean_cosine = F.cosine_similarity(
+        last_response.unsqueeze(0),
+        final_response_mean.unsqueeze(0),
+        dim=-1,
+    ).squeeze(0)
 
-    return torch.cat(pooled, dim=0).float()
+    final_update_norm = update_norm_by_token[-1]
+    return torch.stack(
+        [
+            torch.log1p(final_response.new_tensor(float(n_context_tokens))),
+            final_response.new_tensor(float(n_response_tokens / n_context_tokens)),
+            final_norm.mean(),
+            final_norm.std(unbiased=False),
+            update_norm_by_token.mean(),
+            final_update_norm.mean(),
+            prompt_response_cosine,
+            last_to_mean_cosine,
+        ]
+    ).float()
 
 
 def _real_token_positions(
@@ -239,7 +274,7 @@ def aggregation_and_feature_extraction(
 
     Returns:
         A 1-D float tensor. With the default aggregation for Qwen2.5-0.5B,
-        this has 9121 values, plus any optional geometric features.
+        this has 238 values, plus any optional geometric features.
     """
     agg_features = aggregate(hidden_states, attention_mask)  # (feature_dim,)
 
