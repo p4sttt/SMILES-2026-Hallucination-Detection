@@ -59,10 +59,47 @@ BATCH_SIZE    = 4
 USE_GEOMETRIC = False                  # set True to enable geometric feature extraction
 TEST_FILE        = "./data/test.csv"   # competition test set (labels are null)
 PREDICTIONS_FILE = "predictions.csv"   # output file with predicted labels
+MIN_PROMPT_TOKENS = 96                 # preserve the question/context tail
 
 assert OUTPUT_FILE == "results.json"
 assert PREDICTIONS_FILE == "predictions.csv"
 # ---------------------------------------------------------------------
+def tokenize_prompt_response_batch(
+    prompts: list[str],
+    responses: list[str],
+    tokenizer,
+) -> tuple[dict[str, torch.Tensor], list[int]]:
+    """Tokenize prompt/response pairs while keeping response tokens in view.
+
+    Plain ``truncation=True`` on ``prompt + response`` keeps the beginning of
+    long prompts and may remove the answer.  Here we keep the tail of the prompt
+    plus as much of the response as fits in MAX_LENGTH, and return the response
+    start offset for each padded sample.
+    """
+    batch_input_ids = []
+    response_starts = []
+
+    for prompt, response in zip(prompts, responses):
+        prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
+
+        max_response_tokens = max(1, MAX_LENGTH - MIN_PROMPT_TOKENS)
+        kept_response = response_ids[-max_response_tokens:]
+        prompt_budget = max(0, MAX_LENGTH - len(kept_response))
+        kept_prompt = prompt_ids[-prompt_budget:] if prompt_budget else []
+
+        input_ids = kept_prompt + kept_response
+        batch_input_ids.append(input_ids)
+        response_starts.append(len(kept_prompt))
+
+    encoding = tokenizer.pad(
+        {"input_ids": batch_input_ids},
+        padding=True,
+        return_tensors="pt",
+    )
+    return encoding, response_starts
+
+
 if __name__=='__main__':
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -80,7 +117,8 @@ if __name__=='__main__':
     df = pd.read_csv(DATA_FILE)
 
     # Build the text fed to the LLM: concatenation of prompt and response.
-    all_texts  = [f"{row['prompt']}{row['response']}" for _, row in df.iterrows()]
+    all_prompts = [str(row["prompt"]) for _, row in df.iterrows()]
+    all_responses = [str(row["response"]) for _, row in df.iterrows()]
     all_labels = np.array([int(float(h)) for h in df["label"]])
 
     n_total = len(all_labels)
@@ -114,17 +152,16 @@ if __name__=='__main__':
     all_features: list = []
     t0 = time.time()
 
-    for start in tqdm(range(0, len(all_texts), BATCH_SIZE),
+    for start in tqdm(range(0, len(all_prompts), BATCH_SIZE),
                     desc="Extracting & aggregating", unit="batch"):
 
         # ── 1. Tokenise the current mini-batch ───────────────────────────────
-        batch_texts = all_texts[start : start + BATCH_SIZE]
-        encoding = tokenizer(
-            batch_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=MAX_LENGTH,
+        batch_prompts = all_prompts[start : start + BATCH_SIZE]
+        batch_responses = all_responses[start : start + BATCH_SIZE]
+        encoding, response_starts = tokenize_prompt_response_batch(
+            batch_prompts,
+            batch_responses,
+            tokenizer,
         )
         input_ids      = encoding["input_ids"].to(device)
         attention_mask = encoding["attention_mask"].to(device)
@@ -148,6 +185,9 @@ if __name__=='__main__':
                 hidden[i],   # (n_layers, seq_len, hidden_dim)
                 mask[i],     # (seq_len,)
                 use_geometric=USE_GEOMETRIC,
+                response_start=response_starts[i],
+                input_ids=input_ids[i],
+                logits=outputs.logits[i],
             )
             all_features.append(feat.cpu())
 
@@ -177,23 +217,23 @@ if __name__=='__main__':
 
     # ── Load test data ────────────────────────────────────────────────────────
     df_test    = pd.read_csv(TEST_FILE)
-    test_texts = [f"{row['prompt']}{row['response']}" for _, row in df_test.iterrows()]
+    test_prompts = [str(row["prompt"]) for _, row in df_test.iterrows()]
+    test_responses = [str(row["response"]) for _, row in df_test.iterrows()]
     test_ids   = df_test.index
-    print(f"Test set loaded: {len(test_texts)} samples")
+    print(f"Test set loaded: {len(test_prompts)} samples")
 
     # ── Extract features for test set (same loop as Section 4) ───────────────
     test_features: list = []
 
-    for start in tqdm(range(0, len(test_texts), BATCH_SIZE),
+    for start in tqdm(range(0, len(test_prompts), BATCH_SIZE),
                     desc="Test extraction & aggregation", unit="batch"):
 
-        batch_texts = test_texts[start : start + BATCH_SIZE]
-        encoding = tokenizer(
-            batch_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=MAX_LENGTH,
+        batch_prompts = test_prompts[start : start + BATCH_SIZE]
+        batch_responses = test_responses[start : start + BATCH_SIZE]
+        encoding, response_starts = tokenize_prompt_response_batch(
+            batch_prompts,
+            batch_responses,
+            tokenizer,
         )
         input_ids      = encoding["input_ids"].to(device)
         attention_mask = encoding["attention_mask"].to(device)
@@ -206,7 +246,12 @@ if __name__=='__main__':
 
         for i in range(hidden.size(0)):
             feat = aggregation_and_feature_extraction(
-                hidden[i], mask[i], use_geometric=USE_GEOMETRIC,
+                hidden[i],
+                mask[i],
+                use_geometric=USE_GEOMETRIC,
+                response_start=response_starts[i],
+                input_ids=input_ids[i],
+                logits=outputs.logits[i],
             )
             test_features.append(feat.cpu())
 
@@ -225,4 +270,3 @@ if __name__=='__main__':
 
     # ── Predict and save ────────────────────────────────────────────────────
     save_predictions(final_probe, X_test, test_ids, PREDICTIONS_FILE)
-

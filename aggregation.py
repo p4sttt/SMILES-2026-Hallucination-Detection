@@ -26,11 +26,15 @@ RESPONSE_FRACTION = 0.35
 MAX_RESPONSE_TOKENS = 192
 FEATURES_PER_TRANSITION = 10
 GLOBAL_FEATURES = 8
+LOGPROB_FEATURES = 8
 
 
 def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
+    response_start: int | None = None,
+    input_ids: torch.Tensor | None = None,
+    logits: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Convert per-token hidden states into a single feature vector.
 
@@ -45,7 +49,8 @@ def aggregate(
         A compact 1-D feature tensor with ICR-like projection statistics,
         hidden-state dynamics summaries, and a few global response/context
         alignment features. For Qwen2.5-0.5B this is
-        ``23 * FEATURES_PER_TRANSITION + GLOBAL_FEATURES`` values.
+        ``23 * FEATURES_PER_TRANSITION + GLOBAL_FEATURES + LOGPROB_FEATURES``
+        values.
 
     Student task:
         Replace or extend the skeleton below with alternative layer selection,
@@ -55,13 +60,19 @@ def aggregate(
     n_layer_transitions = max(n_hs - 2, 0)
 
     features = hidden_states.new_zeros(
-        n_layer_transitions * FEATURES_PER_TRANSITION + GLOBAL_FEATURES
+        n_layer_transitions * FEATURES_PER_TRANSITION
+        + GLOBAL_FEATURES
+        + LOGPROB_FEATURES
     )
     if n_layer_transitions == 0:
         return features.float()
 
     context_pos = _real_token_positions(hidden_states, attention_mask)
-    response_pos = _select_response_positions(hidden_states, attention_mask)
+    response_pos = _select_response_positions(
+        hidden_states,
+        attention_mask,
+        response_start=response_start,
+    )
     n_context_tokens = context_pos.numel()
     n_response_tokens = response_pos.numel()
     if n_context_tokens <= 1 or n_response_tokens <= 1:
@@ -139,7 +150,14 @@ def aggregate(
         response_pos,
         update_norm_by_token,
     )
-    return torch.cat([icr_features, global_features], dim=0).float()
+    logprob_features = _response_logprob_features(
+        input_ids=input_ids,
+        logits=logits,
+        attention_mask=attention_mask,
+        response_start=response_start,
+        device=hidden_states.device,
+    )
+    return torch.cat([icr_features, global_features, logprob_features], dim=0).float()
 
 
 def _global_response_features(
@@ -188,6 +206,48 @@ def _global_response_features(
     ).float()
 
 
+def _response_logprob_features(
+    input_ids: torch.Tensor | None,
+    logits: torch.Tensor | None,
+    attention_mask: torch.Tensor,
+    response_start: int | None,
+    device: torch.device,
+) -> torch.Tensor:
+    features = torch.zeros(LOGPROB_FEATURES, device=device, dtype=torch.float32)
+    if input_ids is None or logits is None or response_start is None:
+        return features
+
+    real_len = int(attention_mask.to(dtype=torch.long).sum().item())
+    start = max(1, min(int(response_start), real_len - 1))
+    if real_len - start <= 1:
+        return features
+
+    token_positions = torch.arange(start, real_len, device=logits.device)
+    pred_positions = token_positions - 1
+    targets = input_ids.to(device=logits.device, dtype=torch.long)[token_positions]
+
+    pred_logits = logits[pred_positions].float()
+    target_logits = pred_logits.gather(1, targets.unsqueeze(1)).squeeze(1)
+    nll = torch.logsumexp(pred_logits, dim=-1) - target_logits
+    target_margin = target_logits - pred_logits.max(dim=-1).values
+
+    head = nll[: min(16, nll.numel())]
+    tail = nll[-min(16, nll.numel()) :]
+    features = torch.stack(
+        [
+            nll.mean(),
+            nll.std(unbiased=False),
+            nll.min(),
+            nll.max(),
+            head.mean(),
+            tail.mean(),
+            target_margin.mean(),
+            target_margin.std(unbiased=False),
+        ]
+    )
+    return features.to(device=device, dtype=torch.float32)
+
+
 def _real_token_positions(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -199,6 +259,7 @@ def _real_token_positions(
 def _select_response_positions(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
+    response_start: int | None = None,
 ) -> torch.Tensor:
     """Select likely assistant-response positions with a simple suffix prior.
 
@@ -212,6 +273,12 @@ def _select_response_positions(
     n_tokens = valid_pos.numel()
     if n_tokens <= MIN_RESPONSE_TOKENS:
         return valid_pos
+
+    if response_start is not None:
+        start = max(0, min(int(response_start), n_tokens - 1))
+        response_pos = valid_pos[start:]
+        if response_pos.numel() > 1:
+            return response_pos
 
     adaptive_tail = max(TOKEN_TAILS, int(round(n_tokens * RESPONSE_FRACTION)))
     n_response = min(
@@ -257,6 +324,9 @@ def aggregation_and_feature_extraction(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
     use_geometric: bool = False,
+    response_start: int | None = None,
+    input_ids: torch.Tensor | None = None,
+    logits: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Aggregate hidden states and optionally append geometric features.
 
@@ -274,9 +344,15 @@ def aggregation_and_feature_extraction(
 
     Returns:
         A 1-D float tensor. With the default aggregation for Qwen2.5-0.5B,
-        this has 238 values, plus any optional geometric features.
+        this has 246 values, plus any optional geometric features.
     """
-    agg_features = aggregate(hidden_states, attention_mask)  # (feature_dim,)
+    agg_features = aggregate(
+        hidden_states,
+        attention_mask,
+        response_start=response_start,
+        input_ids=input_ids,
+        logits=logits,
+    )
 
     if use_geometric:
         geo_features = extract_geometric_features(hidden_states, attention_mask)

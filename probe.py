@@ -146,8 +146,8 @@ class HallucinationProbe(nn.Module):
         ranked = sorted(
             model_records,
             key=lambda record: (
-                record["accuracy"],
                 record["auroc"],
+                record["accuracy"],
                 record["regularization_tie_break"],
                 record["class_weight_tie_break"],
             ),
